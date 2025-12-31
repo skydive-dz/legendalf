@@ -627,7 +627,7 @@ def _build_new_year_recipients(data: dict) -> list[int]:
     return sorted(recipients)
 
 
-def _set_commands_with_retry(bot_instance, commands, scope, label: str, retries: int = 3, base_delay: float = 1.0) -> bool:
+def _set_commands_with_retry(bot_instance, commands, scope, label: str, retries: int = 5, base_delay: float = 0.5) -> bool:
     for attempt in range(1, retries + 1):
         try:
             bot_instance.set_my_commands(commands, scope=scope)
@@ -636,7 +636,8 @@ def _set_commands_with_retry(bot_instance, commands, scope, label: str, retries:
             if attempt == retries:
                 logger.warning("Failed to update %s after %d attempt(s): %s", label, retries, exc)
                 return False
-            delay = base_delay * attempt
+            jitter = random.uniform(0, base_delay)
+            delay = base_delay * attempt + jitter
             logger.warning("Retrying %s in %.1fs due to error: %s", label, delay, exc)
             time.sleep(delay)
     return False

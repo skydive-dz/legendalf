@@ -8,6 +8,10 @@ from pathlib import Path
 
 import logging
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyParameters
+try:
+    from telebot.types import LinkPreviewOptions
+except Exception:  # pragma: no cover
+    LinkPreviewOptions = None  # type: ignore
 
 try:
     from zoneinfo import ZoneInfo
@@ -162,6 +166,11 @@ def _build_reply_parameters(
     if allow_without_reply is not None:
         params["allow_sending_without_reply"] = allow_without_reply
     return ReplyParameters(**params)
+
+def _no_preview_kwargs() -> dict:
+    if LinkPreviewOptions is None:
+        return {"disable_web_page_preview": True}
+    return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
 
 def _add_back_button(markup: InlineKeyboardMarkup, user_id: int, action: str | None = None) -> None:
     payload = f"schedback:{user_id}"
@@ -732,14 +741,30 @@ def register(
                     message.from_user.id,
                     exc,
                 )
-        bot.send_message(
-            message.chat.id,
-            caption,
-            parse_mode="HTML",
-            reply_parameters=_build_reply_parameters(
-                message.message_id, allow_without_reply=True
-            ),
-        )
+        try:
+            bot.send_message(
+                message.chat.id,
+                caption,
+                parse_mode="HTML",
+                reply_parameters=_build_reply_parameters(
+                    message.message_id, allow_without_reply=True
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to send holidays text for /holydays (user %s): %s",
+                message.from_user.id,
+                exc,
+            )
+            time.sleep(1)
+            bot.send_message(
+                message.chat.id,
+                caption,
+                parse_mode="HTML",
+                reply_parameters=_build_reply_parameters(
+                    message.message_id, allow_without_reply=True
+                ),
+            )
         if not photo_sent:
             logger.info(
                 "Sent holidays text only to user %s (names=%d)",
@@ -866,7 +891,7 @@ def register(
                                             uid,
                                             payload,
                                             parse_mode="HTML",
-                                            disable_web_page_preview=True,
+                                            **_no_preview_kwargs(),
                                         )
                                 sent = True
                             except Exception as exc:
@@ -898,7 +923,7 @@ def register(
                                             uid,
                                             caption,
                                             parse_mode="HTML",
-                                            disable_web_page_preview=True,
+                                            **_no_preview_kwargs(),
                                         )
                                 sent = True
                             except Exception as exc:

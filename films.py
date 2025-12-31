@@ -10,6 +10,10 @@ import logging
 import re
 import requests
 from telebot.types import ReplyParameters
+try:
+    from telebot.types import LinkPreviewOptions
+except Exception:  # pragma: no cover
+    LinkPreviewOptions = None  # type: ignore
 
 logger = logging.getLogger("legendalf.films")
 
@@ -75,6 +79,11 @@ def _build_reply_parameters(
     if allow_without_reply is not None:
         params["allow_sending_without_reply"] = allow_without_reply
     return ReplyParameters(**params)
+
+def _no_preview_kwargs() -> dict:
+    if LinkPreviewOptions is None:
+        return {"disable_web_page_preview": True}
+    return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
 
 
 def _format_date(date_iso: str) -> str:
@@ -382,7 +391,7 @@ def register(bot, is_allowed_fn) -> None:
                     payload,
                     parse_mode="HTML",
                     reply_parameters=_build_reply_parameters(message.message_id, allow_without_reply=True),
-                    disable_web_page_preview=True,
+                    **_no_preview_kwargs(),
                 )
             except Exception as exc:
                 logger.warning("Failed to send /films_month message: %s", exc)
