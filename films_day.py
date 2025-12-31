@@ -309,6 +309,16 @@ def _fetch_premieres(target_date: date) -> list[PremiereItem]:
     return [item for item in parser.items if item.date_iso == target_date.isoformat()] or parser.items
 
 
+def build_daily_payloads(target_date: date) -> list[tuple[str, str]]:
+    items = _fetch_premieres(target_date)
+    if not items:
+        return []
+    payloads: list[tuple[str, str]] = []
+    for item in items:
+        payloads.append((item.poster_url, _format_item_caption(item)))
+    return payloads
+
+
 def _format_item_caption(item: PremiereItem) -> str:
     title = item.title
     if item.year:

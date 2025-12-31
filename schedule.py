@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
 
 from holidays import HolidayFetchError, HolidayService, build_holiday_caption, image_stream
 from films import build_monthly_messages
+from films_day import build_daily_payloads
 
 
 # Принимаем HH:MM и HH.MM
@@ -26,15 +27,18 @@ _TZ_EXAMPLE = "Europe/Moscow"
 _KIND_BASE = "base"
 _KIND_HOLIDAYS = "holidays"
 _KIND_FILMS = "films"
+_KIND_FILMS_DAY = "films_day"
 _KIND_LABELS = {
     _KIND_BASE: "База дня",
     _KIND_HOLIDAYS: "Праздники дня",
     _KIND_FILMS: "Кинопремьеры месяца",
+    _KIND_FILMS_DAY: "Премьеры дня",
 }
 _KIND_ALIASES = {
     _KIND_BASE: {"1", "база", "base", "quotes", "цитаты"},
     _KIND_HOLIDAYS: {"2", "празд", "праздники", "holidays", "holiday"},
     _KIND_FILMS: {"3", "films", "film", "кино", "фильмы", "премьеры", "кинопремьеры"},
+    _KIND_FILMS_DAY: {"4", "films_day", "film_day", "премьеры дня", "кино дня", "фильмы дня"},
 }
 
 _BACK_BUTTON_TEXT = "⬅️ Назад"
@@ -287,7 +291,7 @@ def _ensure_user_schedule(data: dict, uid: int, default_tz: str) -> dict:
         kinds[kind_name] = k_entry
         return k_entry
 
-    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS):
+    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS, _KIND_FILMS_DAY):
         ensure_kind(kind_name)
 
     if legacy_kind in {_KIND_BASE, _KIND_HOLIDAYS}:
@@ -309,7 +313,7 @@ def _render_schedule(entry: dict, default_tz: str) -> str:
         f"- часовой пояс: {tz}",
     ]
     kinds = entry.get("kinds", {})
-    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS):
+    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS, _KIND_FILMS_DAY):
         label = _KIND_LABELS.get(kind_name, kind_name)
         k_entry = kinds.get(kind_name, {})
         at_time = k_entry.get("at_time") or "не задано"
@@ -401,6 +405,7 @@ def register(
                 InlineKeyboardButton("База дня", callback_data=f"scheddel:{user_id}:{_KIND_BASE}"),
                 InlineKeyboardButton("Праздники сегодня", callback_data=f"scheddel:{user_id}:{_KIND_HOLIDAYS}"),
                 InlineKeyboardButton("Кинопремьеры месяца", callback_data=f"scheddel:{user_id}:{_KIND_FILMS}"),
+                InlineKeyboardButton("Кинопремьеры дня", callback_data=f"scheddel:{user_id}:{_KIND_FILMS_DAY}"),
             )
             _add_back_button(markup, user_id, "del")
         else:
@@ -408,6 +413,7 @@ def register(
                 InlineKeyboardButton("База дня", callback_data=f"schedkind:{user_id}:{_KIND_BASE}"),
                 InlineKeyboardButton("Праздники сегодня", callback_data=f"schedkind:{user_id}:{_KIND_HOLIDAYS}"),
                 InlineKeyboardButton("Кинопремьеры месяца", callback_data=f"schedkind:{user_id}:{_KIND_FILMS}"),
+                InlineKeyboardButton("Кинопремьеры дня", callback_data=f"schedkind:{user_id}:{_KIND_FILMS_DAY}"),
             )
             _add_back_button(markup, user_id, "add")
         return markup
@@ -436,7 +442,7 @@ def register(
         if not kind:
             prompt = bot.send_message(
                 message.chat.id,
-                "Ответь 1 (база), 2 (праздники) или 3 (кинопремьеры), и мы продолжим.",
+                "Ответь 1 (база), 2 (праздники), 3 (кинопремьеры месяца) или 4 (премьеры дня), и мы продолжим.",
                 reply_markup=_build_schedule_kind_markup(message.from_user.id, "add"),
             )
             bot.register_next_step_handler(prompt, _schedule_add_kind_step)
@@ -577,7 +583,7 @@ def register(
         if not kind:
             prompt = bot.send_message(
                 message.chat.id,
-                "Ответь 1, 2 или 3, чтобы выбрать модуль.",
+                "Ответь 1, 2, 3 или 4, чтобы выбрать модуль.",
                 reply_markup=_build_schedule_kind_markup(message.from_user.id, "del"),
             )
             bot.register_next_step_handler(prompt, _schedule_del_kind_step)
@@ -649,7 +655,7 @@ def register(
             if parts[1].strip() and target_kind is None:
                 reply(
                     message,
-                    "Укажи 1 (база) или 2 (праздники), чтобы переключить конкретный модуль.",
+                    "Укажи 1 (база), 2 (праздники), 3 (кинопремьеры месяца) или 4 (премьеры дня), чтобы переключить конкретный модуль.",
                 )
                 return
 
@@ -866,6 +872,38 @@ def register(
                             except Exception as exc:
                                 logger.warning("Failed to fetch films for schedule (user=%s): %s", uid, exc)
                                 bot.send_message(uid, "Не получилось получить список премьер. Попробуйте позже.")
+                        elif kind_name == _KIND_FILMS_DAY:
+                            try:
+                                payloads = build_daily_payloads(now_local.date())
+                                if not payloads:
+                                    bot.send_message(uid, "Фильмов сегодня нет, Гэндальф грустит 😢")
+                                else:
+                                    for poster_url, caption in payloads:
+                                        if poster_url:
+                                            try:
+                                                bot.send_photo(
+                                                    uid,
+                                                    poster_url,
+                                                    caption=caption,
+                                                    parse_mode="HTML",
+                                                )
+                                                continue
+                                            except Exception as exc:
+                                                logger.warning(
+                                                    "Failed to send films_day poster to %s: %s",
+                                                    uid,
+                                                    exc,
+                                                )
+                                        bot.send_message(
+                                            uid,
+                                            caption,
+                                            parse_mode="HTML",
+                                            disable_web_page_preview=True,
+                                        )
+                                sent = True
+                            except Exception as exc:
+                                logger.warning("Failed to fetch daily films for schedule (user=%s): %s", uid, exc)
+                                bot.send_message(uid, "Не получилось получить список премьер дня. Попробуйте позже.")
                         else:
                             quote = _random_quote(quotes_file)
                             caption = f"База дня: {quote}"
