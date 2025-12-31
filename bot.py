@@ -3,7 +3,7 @@ import os
 import random
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import importlib.util
 import logging
@@ -17,13 +17,13 @@ from telebot.types import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChatMember,
-    BotCommandScopeChat,  # FIX: был нужен для fallback
+    BotCommandScopeChat,
 )
 
 from holidays import HolidayService
 
 
-# --- FIX: гарантированно импортируем ЛОКАЛЬНЫЙ schedule.py рядом с bot.py ---
+# --- гарантированно импортируем ЛОКАЛЬНЫЙ schedule.py рядом с bot.py ---
 def import_local_schedule():
     """
     Гарантирует импорт именно вашего файла schedule.py, лежащего рядом с bot.py,
@@ -47,6 +47,9 @@ def import_local_schedule():
 
 schedule = import_local_schedule()
 # ---------------------------------------------------------------------------
+
+KIND_BASE = getattr(schedule, "_KIND_BASE", "base")
+KIND_HOLIDAYS = getattr(schedule, "_KIND_HOLIDAYS", "holidays")
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -132,7 +135,7 @@ def _build_reply_parameters(
 
 
 def default_data():
-    return {"admins": [], "allowed": {}, "pending": {}}
+    return {"admins": [], "allowed": {}, "pending": {}, "schedules": {}}
 
 
 def load_json():
@@ -143,6 +146,7 @@ def load_json():
     data.setdefault("admins", [])
     data.setdefault("allowed", {})
     data.setdefault("pending", {})
+    data.setdefault("schedules", {})
     if isinstance(data.get("allowed"), list):
         data["allowed"] = {str(uid): {"added_at": now_iso_utc()} for uid in data["allowed"]}
     if isinstance(data.get("pending"), list):
@@ -161,6 +165,135 @@ def user_meta(user):
         "first_name": user.first_name or None,
         "last_name": user.last_name or None,
     }
+
+
+def _format_username(username: str | None) -> str:
+    if not username:
+        return "—"
+    return username if username.startswith("@") else f"@{username}"
+
+
+def _display_name(meta: dict | None, uid: int) -> str:
+    if not isinstance(meta, dict):
+        return f"путника {uid}"
+    full_name = " ".join(filter(None, [meta.get("first_name"), meta.get("last_name")])).strip()
+    if full_name:
+        return full_name
+    username = meta.get("username")
+    if username:
+        return _format_username(username)
+    return f"путника {uid}"
+
+
+def _humanize_birthday(value: str | None) -> str:
+    if not value:
+        return "не задан"
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return value
+    return dt.strftime("%d.%m.%Y")
+
+
+def _describe_schedule_kind(entry: dict, kind_name: str) -> str:
+    kinds = entry.get("kinds")
+    if not isinstance(kinds, dict):
+        return "нет"
+    kind_entry = kinds.get(kind_name)
+    if not isinstance(kind_entry, dict):
+        return "нет"
+    at_time = (kind_entry.get("at_time") or "").strip() or "—"
+    enabled = bool(kind_entry.get("enabled")) and at_time not in {"", "—"}
+    state = "вкл" if enabled else "выкл"
+    return f"{state} ({at_time})"
+
+
+def _build_user_overview_text() -> str:
+    data = load_json()
+    schedules = data.get("schedules", {})
+    allowed = data.get("allowed", {})
+    lines: list[str] = []
+
+    if allowed:
+        lines.append("Допущенные:")
+        for suid in sorted(allowed.keys(), key=lambda x: int(x)):
+            meta = allowed[suid]
+            entry = schedules.get(suid, {})
+            uname = _format_username(meta.get("username"))
+            full_name = " ".join(filter(None, [meta.get("first_name"), meta.get("last_name")])).strip()
+            title = f"{suid}: {uname}"
+            if full_name:
+                title += f" — {full_name}"
+            lines.append(title)
+            tz = entry.get("tz") or "не задан"
+            base_desc = _describe_schedule_kind(entry, KIND_BASE)
+            holidays_desc = _describe_schedule_kind(entry, KIND_HOLIDAYS)
+            birthday = _humanize_birthday(meta.get("birthday"))
+            lines.append(
+                f"  TZ: {tz}; база: {base_desc}; праздники: {holidays_desc}; ДР: {birthday}"
+            )
+    else:
+        lines.append("Допущенных пока нет.")
+
+    pending = data.get("pending", {})
+    if pending:
+        lines.append("")
+        lines.append("У врат:")
+        for suid in sorted(pending.keys(), key=lambda x: int(x)):
+            meta = pending[suid]
+            uname = _format_username(meta.get("username"))
+            requested = meta.get("requested_at", "неизвестно")
+            lines.append(f"{suid}: {uname} — ждёт с {requested}")
+    return "\n".join(lines)
+
+
+def _find_user_record(data: dict, identifier: str):
+    if not identifier:
+        return None
+    ident = identifier.strip()
+    if ident.startswith("@"):
+        ident = ident[1:]
+    if not ident:
+        return None
+
+    buckets = []
+    for bucket_name in ("allowed", "pending"):
+        bucket = data.get(bucket_name)
+        if isinstance(bucket, dict):
+            buckets.append((bucket_name, bucket))
+
+    if ident.isdigit():
+        for bucket_name, bucket in buckets:
+            if ident in bucket:
+                return bucket_name, ident, bucket[ident]
+        return None
+
+    needle = ident.lower()
+    for bucket_name, bucket in buckets:
+        for suid, meta in bucket.items():
+            username = meta.get("username")
+            if not username:
+                continue
+            uname_norm = username.lstrip("@").lower()
+            if uname_norm == needle:
+                return bucket_name, suid, meta
+    return None
+
+
+def _set_user_birthday(identifier: str, born: datetime.date):
+    data = load_json()
+    found = _find_user_record(data, identifier)
+    if not found:
+        return None
+    bucket_name, suid, meta = found
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["birthday"] = born.isoformat()
+    bucket = data.get(bucket_name, {})
+    bucket[suid] = meta
+    data[bucket_name] = bucket
+    save_json(data)
+    return bucket_name, suid, meta
 
 
 def load_quotes():
@@ -442,7 +575,7 @@ def format_user_line(uid: str, meta: dict) -> str:
 def setup_commands():
     # Команды, которые видят ВСЕ
     common_commands = [
-        BotCommand("start", "Попросить допуск к мудрости"),
+        BotCommand("mellon", "Молви «друг» и войди"),
         BotCommand("id", "Узнать свой знак (user_id)"),
         BotCommand("schedule", "График рассылки"),  # рекомендую показывать всем допущенным
         BotCommand("holydays", "Праздники сегодняшнего дня"),
@@ -453,6 +586,7 @@ def setup_commands():
         BotCommand("pending", "Список путников у врат"),
         BotCommand("allow", "Открыть путь путнику"),
         BotCommand("deny", "Отказать путнику"),
+        BotCommand("users", "Путники"),
         BotCommand("restart", "Перезапустить"),
     ]
 
@@ -525,7 +659,7 @@ def cmd_id(message):
     )
 
 
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=["mellon"])
 def cmd_start(message):
     uid = message.from_user.id
 
@@ -570,6 +704,42 @@ def cmd_pending(message):
     lines.append("\nОткрыть путь: /allow <id>\nОтказать: /deny <id>")
 
     bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["users"])
+def cmd_users(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        bot.reply_to(message, _build_user_overview_text())
+        return
+
+    if len(parts) < 3:
+        bot.reply_to(message, "Формат: /users <id|username> ДД.ММ.ГГГГ")
+        return
+
+    identifier = parts[1]
+    date_token = parts[2]
+    try:
+        born = datetime.strptime(date_token, "%d.%m.%Y").date()
+    except ValueError:
+        bot.reply_to(message, "Не понял дату. Пример: 12.11.1993")
+        return
+
+    result = _set_user_birthday(identifier, born)
+    if not result:
+        bot.reply_to(message, "Не нашёл такого путника среди допущенных или ожидающих.")
+        return
+
+    bucket_name, suid, meta = result
+    display = _display_name(meta, int(suid))
+    scope = "среди допущенных" if bucket_name == "allowed" else "в очереди у врат"
+    bot.reply_to(
+        message,
+        f"Записал день рождения {display}: {born.strftime('%d.%m.%Y')} ({scope}).",
+    )
 
 
 @bot.message_handler(commands=["allow"])
@@ -690,7 +860,7 @@ def admin_ingest(message):
     if message.content_type == "text":
         text = (message.text or "").strip()
 
-        # команды оставляем стандартным хэндлерам (/start, /id, /schedule, etc.)
+        # команды оставляем стандартным хэндлерам (/mellon, /id, /schedule, etc.)
         if text.startswith("/"):
             return
 
@@ -746,7 +916,7 @@ def on_message(message):
         bot.reply_to(
             message,
             "Прежде чем искать ответы, нужно попросить дозволения.\n"
-            "Напиши /start — и я передам твоё имя дальше.",
+            "Напиши /mellon — и я передам твоё имя дальше.",
         )
         return
 

@@ -25,13 +25,57 @@ _TZ_EXAMPLE = "Europe/Moscow"
 _KIND_BASE = "base"
 _KIND_HOLIDAYS = "holidays"
 _KIND_LABELS = {
-    _KIND_BASE: "«База дня»",
+    _KIND_BASE: "База дня",
     _KIND_HOLIDAYS: "Праздники дня",
 }
 _KIND_ALIASES = {
     _KIND_BASE: {"1", "база", "base", "quotes", "цитаты"},
     _KIND_HOLIDAYS: {"2", "празд", "праздники", "holidays", "holiday"},
 }
+
+_NEW_YEAR_GREETING = (
+    "Народы Средиземья!\n\n"
+    "Я — Гэндальф Белый, странник дорог и хранитель огня надежды. В этот час, когда старый год уходит, "
+    "словно тень за западные холмы, а новый поднимается, как рассвет над Белыми горами, я обращаюсь ко всем "
+    "вам — от заснеженных чертогов Эребора до тихих садов Шира, от лесных чертогов Лориэна до каменных улиц "
+    "Минас-Тирита.\n\n"
+    "Пусть для эльфов новый год будет светел и ясен, как звёзды над Валинором, и пусть память не будет "
+    "бременем, а станет песней.\n"
+    "Пусть гномы укрепят свои залы, найдут утраченные сокровища и вспомнят, что истинное золото — это верность "
+    "и честь.\n"
+    "Пусть люди не забудут, что даже во тьме выбор остаётся за ними, и что мужество сердца важнее силы меча.\n"
+    "Пусть хоббиты хранят тепло очагов, смех за столом и простую мудрость, которая не раз спасала мир.\n"
+    "И даже тем, кто бродит по диким тропам и живёт вдали от песен и хроник, пусть новый год принесёт дорогу, "
+    "ведущую не к погибели, но к дому.\n\n"
+    "Помните: зло никогда не побеждается окончательно и свет не гаснет навсегда. Каждый новый год — это ещё "
+    "один шанс сделать мир немного добрее, а тьму — чуть менее властной.\n\n"
+    "Так поднимем же кубки — за мир, который мы защищаем, за дружбу, которая сильнее страха, и за надежду, что "
+    "всегда приходит вовремя.\n\n"
+    "С Новым годом вас, народы Средиземья.\n"
+    "Пусть ваши пути будут светлы, а возвращения — радостны."
+)
+
+
+def _build_birthday_greeting(name: str) -> str:
+    return (
+        f"{name}, сегодня даже Белые Деревья шепчут твоё имя.\n"
+        "Пусть дорога будет мягкой, ветер попутным, а сердце смелым.\n"
+        "Я, Гендальф Белый, поднимаю посох в честь твоего дня рождения!"
+    )
+
+
+def _friendly_name(meta: dict | None, uid: int) -> str:
+    if not isinstance(meta, dict):
+        return f"путник {uid}"
+    first = (meta.get("first_name") or "").strip()
+    last = (meta.get("last_name") or "").strip()
+    full_name = " ".join(filter(None, [first, last])).strip()
+    if full_name:
+        return full_name
+    username = (meta.get("username") or "").strip()
+    if username:
+        return username if username.startswith("@") else f"@{username}"
+    return f"путник {uid}"
 
 logger = logging.getLogger("legendalf.schedule")
 
@@ -136,6 +180,44 @@ def _send_random_media_with_caption(bot, chat_id: int, media_dir: Path, caption:
         bot.send_message(chat_id, "Воля была, но видение не открылось. Проверь файл и права доступа.")
 
 
+def _maybe_send_special_messages(bot, uid: int, entry: dict, now_local: datetime, allowed_meta: dict | None) -> bool:
+    special_flags = entry.setdefault("special_flags", {})
+    changed = False
+    hhmm = now_local.strftime("%H:%M")
+
+    if now_local.month == 1 and now_local.day == 1 and hhmm == "00:00":
+        last_year = special_flags.get("new_year_year")
+        if last_year != now_local.year:
+            bot.send_message(uid, _NEW_YEAR_GREETING)
+            special_flags["new_year_year"] = now_local.year
+            logger.info("Sent New Year greeting to %s", uid)
+            changed = True
+
+    birthday_iso = allowed_meta.get("birthday") if isinstance(allowed_meta, dict) else None
+    if birthday_iso:
+        try:
+            birthday_date = datetime.strptime(birthday_iso, "%Y-%m-%d").date()
+        except ValueError:
+            birthday_date = None
+        if (
+            birthday_date
+            and birthday_date.month == now_local.month
+            and birthday_date.day == now_local.day
+            and hhmm == "10:00"
+        ):
+            last_birthday_year = special_flags.get("birthday_year")
+            if last_birthday_year != now_local.year:
+                name = _friendly_name(allowed_meta, uid)
+                bot.send_message(uid, _build_birthday_greeting(name))
+                special_flags["birthday_year"] = now_local.year
+                logger.info("Sent birthday greeting to %s", uid)
+                changed = True
+
+    if changed:
+        entry["special_flags"] = special_flags
+    return changed
+
+
 def _get_tz(tz_name: str):
     if ZoneInfo is None:
         return None
@@ -224,8 +306,8 @@ def _render_schedule(entry: dict, default_tz: str) -> str:
             "/schedule — показать график",
             "/schedule_add — выбрать модуль и задать время",
             "/schedule_del — убрать время для модуля",
-            "/schedule_off [1|2] — выключить всё или конкретный модуль",
-            "/schedule_on [1|2] — включить всё или модуль",
+            "/schedule_off — выключить всё",
+            "/schedule_on — включить всё",
             f"/schedule_tz {_TZ_EXAMPLE} — установить часовой пояс",
         ]
     )
@@ -281,7 +363,7 @@ def register(
             reply(
                 message,
                 "Прежде чем приказывать времени, нужно получить допуск.\n"
-                "Напиши /start — и я передам твоё имя хранителю врат."
+                "Напиши /mellon — и я передам твоё имя хранителю врат."
             )
             return False
         return True
@@ -318,7 +400,7 @@ def register(
     def _schedule_add_kind_step(message):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
-            reply(message, "Путь закрыт. Сначала /start.")
+            reply(message, "Путь закрыт. Сначала /mellon.")
             return
 
         kind = _parse_kind_choice(message.text or "")
@@ -354,6 +436,10 @@ def register(
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except Exception:
             pass
+        try:
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        except Exception:
+            pass
         logger.info("User %s chose schedule kind %s via button", call.from_user.id, kind)
         _request_time_input(call.message.chat.id, call.from_user.id, kind)
 
@@ -368,7 +454,7 @@ def register(
     def _schedule_add_time_step(message, kind: str):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
-            reply(message, "Путь закрыт. Сначала /start.")
+            reply(message, "Путь закрыт. Сначала /mellon.")
             return
 
         text = (message.text or "").strip()
@@ -410,18 +496,24 @@ def register(
         if not _require_allowed(message):
             return
 
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("База дня", callback_data=f"scheddel:{message.from_user.id}:{_KIND_BASE}"),
+            InlineKeyboardButton(
+                "Праздники сегодня", callback_data=f"scheddel:{message.from_user.id}:{_KIND_HOLIDAYS}"
+            ),
+        )
         prompt = reply(
             message,
-            "Какой модуль очистить?\n"
-            "1 — «База дня»\n"
-            "2 — Праздники дня.",
+            "Какой модуль очистить?\n",
+            reply_markup=markup,
         )
         bot.register_next_step_handler(prompt, _schedule_del_kind_step)
 
     def _schedule_del_kind_step(message):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
-            reply(message, "Путь закрыт. Сначала /start.")
+            reply(message, "Путь закрыт. Сначала /mellon.")
             return
 
         kind = _parse_kind_choice(message.text or "")
@@ -433,6 +525,9 @@ def register(
             bot.register_next_step_handler(prompt, _schedule_del_kind_step)
             return
 
+        _clear_schedule_kind(message, uid, kind)
+
+    def _clear_schedule_kind(message, uid: int, kind: str):
         data = load_data()
         entry = _ensure_user_schedule(data, uid, default_tz)
         kinds = entry.get("kinds", {})
@@ -448,6 +543,35 @@ def register(
             f"График для {_KIND_LABELS.get(kind, kind)} очищен.\n\n" + _render_schedule(entry, default_tz),
         )
         save_data(data)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("scheddel:"))
+    def _schedule_del_callback(call):
+        try:
+            _, target_uid, kind = call.data.split(":", 2)
+        except ValueError:
+            bot.answer_callback_query(call.id, "Не разобрал выбор.")
+            return
+
+        if str(call.from_user.id) != target_uid:
+            bot.answer_callback_query(call.id, "Эта кнопка не для тебя.")
+            return
+
+        if not is_allowed_fn(call.from_user.id):
+            bot.answer_callback_query(call.id, "Сначала получи допуск.")
+            return
+
+        bot.answer_callback_query(call.id, "Модуль выбран.")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        try:
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        except Exception:
+            pass
+
+        logger.info("User %s chose schedule delete kind %s via button", call.from_user.id, kind)
+        _clear_schedule_kind(call.message, call.from_user.id, kind)
 
     @bot.message_handler(commands=["schedule_off"])
     def cmd_schedule_off(message):
@@ -558,18 +682,18 @@ def register(
 
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) != 2:
-            reply(message, f"��������� �����: /schedule_tz {_TZ_EXAMPLE}")
+            reply(message, f"Использование команды: /schedule_tz {_TZ_EXAMPLE}")
             return
 
         tz_name = parts[1].strip()
         if ZoneInfo is not None and _get_tz(tz_name) is None:
-            reply(message, f"� �� ����� ���� ������� ����. ������: {_TZ_EXAMPLE} ��� Europe/Berlin.")
+            reply(message, f"Я не знаю этот часовой пояс. Пример: {_TZ_EXAMPLE} или Europe/Berlin.")
             return
 
         data = load_data()
         entry = _ensure_user_schedule(data, message.from_user.id, default_tz)
         entry["tz"] = tz_name
-        reply(message, f"������� ���� ������: {tz_name}.\n\n" + _render_schedule(entry, default_tz))
+        reply(message, f"Часовой пояс принят: {tz_name}.\n\n" + _render_schedule(entry, default_tz))
         save_data(data)
 
 
@@ -581,6 +705,9 @@ def register(
                 schedules = data.get("schedules", {}) if isinstance(data, dict) else {}
                 if not isinstance(schedules, dict):
                     schedules = {}
+                allowed_map = data.get("allowed", {}) if isinstance(data, dict) else {}
+                if not isinstance(allowed_map, dict):
+                    allowed_map = {}
 
                 dirty = False
 
@@ -607,6 +734,12 @@ def register(
                     now_local = _local_now(tz_name)
                     hhmm = now_local.strftime("%H:%M")
                     today = now_local.strftime("%Y-%m-%d")
+                    holiday_kind_entry = kinds.get(_KIND_HOLIDAYS)
+                    holiday_enabled = False
+                    if isinstance(holiday_kind_entry, dict):
+                        holiday_at = (holiday_kind_entry.get("at_time") or "").strip()
+                        if holiday_kind_entry.get("enabled", False) and _TIME_COLON_RE.match(holiday_at):
+                            holiday_enabled = True
 
                     for kind_name, kind_entry in kinds.items():
                         if not isinstance(kind_entry, dict):
@@ -653,6 +786,12 @@ def register(
                             logger.info("Sent %s update to user %s at %s", kind_name, uid, at_time)
                             kind_entry["last_sent"] = {at_time: today}
                             kinds[kind_name] = kind_entry
+                            schedules[suid] = entry
+                            dirty = True
+
+                    if holiday_enabled:
+                        allowed_meta = allowed_map.get(suid)
+                        if _maybe_send_special_messages(bot, uid, entry, now_local, allowed_meta):
                             schedules[suid] = entry
                             dirty = True
 
