@@ -26,6 +26,7 @@ from telebot.types import (
 
 from holidays import HolidayService
 import films
+import films_day
 
 
 # --- гарантированно импортируем ЛОКАЛЬНЫЙ schedule.py рядом с bot.py ---
@@ -601,6 +602,7 @@ def setup_commands():
         BotCommand("id", "Узнать свой знак (user_id)"),
         BotCommand("schedule", "График рассылки"),  # рекомендую показывать всем допущенным
         BotCommand("holydays", "Праздники сегодняшнего дня"),
+        BotCommand("films_day", "Премьеры дня"),
         BotCommand("films_month", "Премьеры месяца (Кинопоиск)"),
     ]
 
@@ -1024,5 +1026,6 @@ if __name__ == "__main__":
         holiday_service=holiday_service,
     )
     films.register(bot, is_allowed)
+    films_day.register(bot, is_allowed)
 
     bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
