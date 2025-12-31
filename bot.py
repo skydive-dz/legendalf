@@ -10,6 +10,7 @@ from pathlib import Path
 import importlib.util
 import functools
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import time
 
 import requests
@@ -63,11 +64,22 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "legendalf.log"
 
+log_format = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+file_handler = TimedRotatingFileHandler(
+    LOG_FILE,
+    when="midnight",
+    interval=1,
+    backupCount=0,
+    encoding="utf-8",
+    delay=True,
+)
+file_handler.suffix = "%d-%m-%Y"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    format=log_format,
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        file_handler,
         logging.StreamHandler(),
     ],
 )
