@@ -6,9 +6,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 import importlib.util
+import logging
 
 import requests
 import telebot
+from telebot.types import ReplyParameters
 from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -17,6 +19,9 @@ from telebot.types import (
     BotCommandScopeChatMember,
     BotCommandScopeChat,  # FIX: был нужен для fallback
 )
+
+from holidays import HolidayService
+
 
 # --- FIX: гарантированно импортируем ЛОКАЛЬНЫЙ schedule.py рядом с bot.py ---
 def import_local_schedule():
@@ -43,11 +48,30 @@ def import_local_schedule():
 schedule = import_local_schedule()
 # ---------------------------------------------------------------------------
 
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "legendalf.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("legendalf.bot")
+
+telebot.logger = logging.getLogger("legendalf.telebot")
+telebot.logger.setLevel(logging.INFO)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var with your bot token")
 
 bot = telebot.TeleBot(TOKEN)
+holiday_service = HolidayService()
 
 DATA_FILE = Path("users.json")
 QUOTES_FILE = Path("/home/skydive-dz/legendalf/quotes.txt")
@@ -94,6 +118,17 @@ def is_media_trigger(text: str) -> bool:
         return False
     t = text.strip().lower()
     return any(re.match(p, t, flags=re.IGNORECASE) for p in MEDIA_TRIGGER_PATTERNS)
+
+
+def _build_reply_parameters(
+    message_id: int | None, allow_without_reply: bool | None = None
+) -> ReplyParameters | None:
+    if message_id is None:
+        return None
+    params: dict[str, object] = {"message_id": message_id}
+    if allow_without_reply is not None:
+        params["allow_sending_without_reply"] = allow_without_reply
+    return ReplyParameters(**params)
 
 
 def default_data():
@@ -171,40 +206,48 @@ def list_media():
     return [p for p in MEDIA_DIR.iterdir() if p.is_file() and p.suffix.lower() in exts]
 
 
-def send_random_media(chat_id: int, reply_to_message_id: int | None = None):
+def send_random_media(
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+    caption: str | None = None,
+):
     """
-    caption = случайная цитата.
+    caption defaults to a random quote.
     """
     media = list_media()
+    rp = _build_reply_parameters(reply_to_message_id, allow_without_reply=True)
+
     if not media:
         bot.send_message(
             chat_id,
             "Я не вижу свитков с образами и видениями в моей папке.\n"
             f"Положи файлы в: {MEDIA_DIR}",
-            reply_to_message_id=reply_to_message_id,
+            reply_parameters=rp,
         )
         return
 
     path = random.choice(media)
-    caption = random_quote()
+    media_caption = caption if caption is not None else random_quote()
 
     try:
         with open(path, "rb") as f:
             ext = path.suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".webp"}:
-                bot.send_photo(chat_id, f, caption=caption, reply_to_message_id=reply_to_message_id)
+                bot.send_photo(chat_id, f, caption=media_caption, reply_parameters=rp)
             elif ext == ".gif":
-                bot.send_animation(chat_id, f, caption=caption, reply_to_message_id=reply_to_message_id)
+                bot.send_animation(chat_id, f, caption=media_caption, reply_parameters=rp)
             elif ext == ".mp4":
-                bot.send_video(chat_id, f, caption=caption, reply_to_message_id=reply_to_message_id)
+                bot.send_video(chat_id, f, caption=media_caption, reply_parameters=rp)
             else:
-                bot.send_document(chat_id, f, caption=caption, reply_to_message_id=reply_to_message_id)
+                bot.send_document(chat_id, f, caption=media_caption, reply_parameters=rp)
     except Exception:
         bot.send_message(
             chat_id,
             "Воля была, но видение не открылось. Проверь файл и права доступа.",
-            reply_to_message_id=reply_to_message_id,
+            reply_parameters=rp,
         )
+
+
 
 
 def _download_telegram_file_stream(file_path: str, out_path: Path) -> None:
@@ -401,7 +444,8 @@ def setup_commands():
     common_commands = [
         BotCommand("start", "Попросить допуск к мудрости"),
         BotCommand("id", "Узнать свой знак (user_id)"),
-        BotCommand("schedule", "График рассылки «База дня»"),  # рекомендую показывать всем допущенным
+        BotCommand("schedule", "График рассылки"),  # рекомендую показывать всем допущенным
+        BotCommand("holydays", "Праздники сегодняшнего дня"),
     ]
 
     # Команды, которые видит ТОЛЬКО админ
@@ -437,6 +481,7 @@ def setup_commands():
 def announce_startup():
     data = load_json()
     admins = data.get("admins", [])
+    logger.info("Announcing startup to %d admin(s)", len(admins))
     text = "Я слуга вечного огня, повелитель пламени Анора!"
     for admin_id in admins:
         try:
@@ -451,9 +496,12 @@ def restart_self():
 
 @bot.message_handler(commands=["restart"])
 def cmd_restart(message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        logger.warning("User %s attempted /restart without permissions", uid)
         return
 
+    logger.info("Admin %s requested /restart", uid)
     bot.reply_to(
         message,
         "Ты призвал меня начать путь заново.\n"
@@ -463,8 +511,8 @@ def cmd_restart(message):
         bot.stop_polling()
     except Exception:
         pass
+    logger.info("Restarting process via execv")
     restart_self()
-
 
 @bot.message_handler(commands=["id"])
 def cmd_id(message):
@@ -581,7 +629,12 @@ def cmd_deny(message):
         pass
 
 
-@bot.callback_query_handler(func=lambda call: True)
+def _admin_gate_callback(call):
+    data = call.data or ""
+    return data.startswith("approve:") or data.startswith("deny:")
+
+
+@bot.callback_query_handler(func=_admin_gate_callback)
 def callbacks(call):
     if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "Эта власть тебе не дана.")
@@ -664,12 +717,24 @@ def admin_ingest(message):
         return
 
     if message.content_type in ("photo", "document", "video", "animation"):
-        bot.reply_to(message, "Принял видение. Записываю его в свитки…")
+        bot.send_message(
+            message.chat.id,
+            "Принял видение. Записываю его в свитки…",
+            reply_parameters=_build_reply_parameters(message.message_id),
+        )
         ok, info = save_media_from_message(message)
         if ok:
-            bot.send_message(message.chat.id, f"Видение сохранено.\n{info}", reply_to_message_id=message.message_id)
+            bot.send_message(
+                message.chat.id,
+                f"Видение сохранено.\n{info}",
+                reply_parameters=_build_reply_parameters(message.message_id),
+            )
         else:
-            bot.send_message(message.chat.id, f"Не удалось сохранить видение.\n{info}", reply_to_message_id=message.message_id)
+            bot.send_message(
+                message.chat.id,
+                f"Не удалось сохранить видение.\n{info}",
+                reply_parameters=_build_reply_parameters(message.message_id),
+            )
         return
 
 
@@ -687,7 +752,10 @@ def on_message(message):
 
     # "Гэндальф?" -> случайная картинка/гиф/видео + подпись-цитата
     if is_media_trigger(message.text):
-        send_random_media(message.chat.id, reply_to_message_id=message.message_id)
+        send_random_media(
+            message.chat.id,
+            reply_to_message_id=message.message_id,
+        )
         return
 
     if is_trigger(message.text):
@@ -702,6 +770,7 @@ def on_message(message):
 
 
 if __name__ == "__main__":
+    logger.info("Legendalf bot starting. Logs: %s", LOG_FILE)
     setup_commands()
     announce_startup()
 
@@ -714,6 +783,7 @@ if __name__ == "__main__":
         is_allowed,
         default_tz="Europe/Moscow",  # FIX: без \"...\"
         poll_interval_sec=30,
+        holiday_service=holiday_service,
     )
 
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
