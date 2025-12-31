@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 from holidays import HolidayFetchError, HolidayService, build_holiday_caption, image_stream
+from films import build_monthly_messages
 
 
 # Принимаем HH:MM и HH.MM
@@ -24,14 +25,19 @@ _TIME_DOT_RE = re.compile(r"^(?:[01]\d|2[0-3])\.[0-5]\d$")
 _TZ_EXAMPLE = "Europe/Moscow"
 _KIND_BASE = "base"
 _KIND_HOLIDAYS = "holidays"
+_KIND_FILMS = "films"
 _KIND_LABELS = {
     _KIND_BASE: "База дня",
     _KIND_HOLIDAYS: "Праздники дня",
+    _KIND_FILMS: "Кинопремьеры месяца",
 }
 _KIND_ALIASES = {
     _KIND_BASE: {"1", "база", "base", "quotes", "цитаты"},
     _KIND_HOLIDAYS: {"2", "празд", "праздники", "holidays", "holiday"},
+    _KIND_FILMS: {"3", "films", "film", "кино", "фильмы", "премьеры", "кинопремьеры"},
 }
+
+_BACK_BUTTON_TEXT = "⬅️ Назад"
 
 _NEW_YEAR_GREETING = (
     "Народы Средиземья!\n\n"
@@ -153,6 +159,17 @@ def _build_reply_parameters(
         params["allow_sending_without_reply"] = allow_without_reply
     return ReplyParameters(**params)
 
+def _add_back_button(markup: InlineKeyboardMarkup, user_id: int, action: str | None = None) -> None:
+    payload = f"schedback:{user_id}"
+    if action:
+        payload = f"{payload}:{action}"
+    markup.add(InlineKeyboardButton(_BACK_BUTTON_TEXT, callback_data=payload))
+
+def _build_back_markup(user_id: int, action: str | None = None) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    _add_back_button(markup, user_id, action)
+    return markup
+
 
 def _send_random_media_with_caption(bot, chat_id: int, media_dir: Path, caption: str) -> None:
     media = _list_media(media_dir)
@@ -270,7 +287,7 @@ def _ensure_user_schedule(data: dict, uid: int, default_tz: str) -> dict:
         kinds[kind_name] = k_entry
         return k_entry
 
-    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS):
+    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS):
         ensure_kind(kind_name)
 
     if legacy_kind in {_KIND_BASE, _KIND_HOLIDAYS}:
@@ -292,7 +309,7 @@ def _render_schedule(entry: dict, default_tz: str) -> str:
         f"- часовой пояс: {tz}",
     ]
     kinds = entry.get("kinds", {})
-    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS):
+    for kind_name in (_KIND_BASE, _KIND_HOLIDAYS, _KIND_FILMS):
         label = _KIND_LABELS.get(kind_name, kind_name)
         k_entry = kinds.get(kind_name, {})
         at_time = k_entry.get("at_time") or "не задано"
@@ -377,22 +394,34 @@ def register(
         reply(message, _render_schedule(entry, default_tz))
         save_data(data)
 
+    def _build_schedule_kind_markup(user_id: int, action: str) -> InlineKeyboardMarkup:
+        markup = InlineKeyboardMarkup(row_width=1)
+        if action == "del":
+            markup.add(
+                InlineKeyboardButton("База дня", callback_data=f"scheddel:{user_id}:{_KIND_BASE}"),
+                InlineKeyboardButton("Праздники сегодня", callback_data=f"scheddel:{user_id}:{_KIND_HOLIDAYS}"),
+                InlineKeyboardButton("Кинопремьеры месяца", callback_data=f"scheddel:{user_id}:{_KIND_FILMS}"),
+            )
+            _add_back_button(markup, user_id, "del")
+        else:
+            markup.add(
+                InlineKeyboardButton("База дня", callback_data=f"schedkind:{user_id}:{_KIND_BASE}"),
+                InlineKeyboardButton("Праздники сегодня", callback_data=f"schedkind:{user_id}:{_KIND_HOLIDAYS}"),
+                InlineKeyboardButton("Кинопремьеры месяца", callback_data=f"schedkind:{user_id}:{_KIND_FILMS}"),
+            )
+            _add_back_button(markup, user_id, "add")
+        return markup
+
     # --- Мастер-диалог для /schedule_add ---
     @bot.message_handler(commands=["schedule_add"])
     def cmd_schedule_add(message):
         if not _require_allowed(message):
             return
 
-        markup = InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            InlineKeyboardButton("База дня", callback_data=f"schedkind:{message.from_user.id}:{_KIND_BASE}"),
-            InlineKeyboardButton(
-                "Праздники сегодня", callback_data=f"schedkind:{message.from_user.id}:{_KIND_HOLIDAYS}"
-            ),
-        )
+        markup = _build_schedule_kind_markup(message.from_user.id, "add")
         prompt = reply(
             message,
-            "Какие весточки хочешь получать?",
+            "Выбери модуль рассылки.",
             reply_markup=markup,
         )
         bot.register_next_step_handler(prompt, _schedule_add_kind_step)
@@ -400,21 +429,55 @@ def register(
     def _schedule_add_kind_step(message):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
-            reply(message, "Путь закрыт. Сначала /mellon.")
+            reply(message, "Доступ закрыт. Отправьте /mellon, чтобы запросить доступ.")
             return
 
         kind = _parse_kind_choice(message.text or "")
         if not kind:
             prompt = bot.send_message(
                 message.chat.id,
-                "Ответь 1 (база) или 2 (праздники), и мы продолжим.",
+                "Ответь 1 (база), 2 (праздники) или 3 (кинопремьеры), и мы продолжим.",
+                reply_markup=_build_schedule_kind_markup(message.from_user.id, "add"),
             )
             bot.register_next_step_handler(prompt, _schedule_add_kind_step)
             return
 
         logger.info("User %s chose schedule kind %s", uid, kind)
         _request_time_input(message.chat.id, uid, kind)
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("schedback:"))
+    def _schedule_back_callback(call):
+        try:
+            _, target_uid, *_ = call.data.split(":")
+        except ValueError:
+            bot.answer_callback_query(call.id, "Некорректная команда.")
+            return
 
+        if str(call.from_user.id) != target_uid:
+            bot.answer_callback_query(call.id, "Эта кнопка не для вас.")
+            return
+
+        if not is_allowed_fn(call.from_user.id):
+            bot.answer_callback_query(call.id, "Доступ закрыт.")
+            return
+
+        bot.answer_callback_query(call.id, "Готово")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        try:
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        except Exception:
+            pass
+
+        data = load_data()
+        entry = _ensure_user_schedule(data, call.from_user.id, default_tz)
+        bot.send_message(
+            call.message.chat.id,
+            _render_schedule(entry, default_tz),
+            reply_parameters=_build_reply_parameters(call.message.message_id, allow_without_reply=True),
+        )
+        save_data(data)
     @bot.callback_query_handler(func=lambda call: call.data.startswith("schedkind:"))
     def _schedule_kind_callback(call):
         try:
@@ -444,13 +507,13 @@ def register(
         _request_time_input(call.message.chat.id, call.from_user.id, kind)
 
     def _request_time_input(chat_id: int, user_id: int, kind: str):
-        kind_label = _KIND_LABELS.get(kind, "«База дня»")
+        kind_label = _KIND_LABELS.get(kind, "База дня")
         prompt = bot.send_message(
             chat_id,
-            f"Укажи время для {kind_label}. Формат ЧЧ:ММ (например 09:00).",
+            f"Укажи время для {kind_label}. Формат HH:MM (например 09:00).",
+            reply_markup=_build_back_markup(user_id, "add"),
         )
         bot.register_next_step_handler(prompt, _schedule_add_time_step, kind)
-
     def _schedule_add_time_step(message, kind: str):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
@@ -496,16 +559,10 @@ def register(
         if not _require_allowed(message):
             return
 
-        markup = InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            InlineKeyboardButton("База дня", callback_data=f"scheddel:{message.from_user.id}:{_KIND_BASE}"),
-            InlineKeyboardButton(
-                "Праздники сегодня", callback_data=f"scheddel:{message.from_user.id}:{_KIND_HOLIDAYS}"
-            ),
-        )
+        markup = _build_schedule_kind_markup(message.from_user.id, "del")
         prompt = reply(
             message,
-            "Какой модуль очистить?\n",
+            "Выбери модуль, чтобы отключить.",
             reply_markup=markup,
         )
         bot.register_next_step_handler(prompt, _schedule_del_kind_step)
@@ -513,20 +570,20 @@ def register(
     def _schedule_del_kind_step(message):
         uid = message.from_user.id
         if not is_allowed_fn(uid):
-            reply(message, "Путь закрыт. Сначала /mellon.")
+            reply(message, "Доступ закрыт. Отправьте /mellon, чтобы запросить доступ.")
             return
 
         kind = _parse_kind_choice(message.text or "")
         if not kind:
             prompt = bot.send_message(
                 message.chat.id,
-                "Ответь 1 или 2, чтобы выбрать модуль.",
+                "Ответь 1, 2 или 3, чтобы выбрать модуль.",
+                reply_markup=_build_schedule_kind_markup(message.from_user.id, "del"),
             )
             bot.register_next_step_handler(prompt, _schedule_del_kind_step)
             return
 
         _clear_schedule_kind(message, uid, kind)
-
     def _clear_schedule_kind(message, uid: int, kind: str):
         data = load_data()
         entry = _ensure_user_schedule(data, uid, default_tz)
@@ -787,15 +844,33 @@ def register(
                                 logger.warning("Failed to fetch holidays for schedule (user=%s)", uid)
                                 bot.send_message(
                                     uid,
-                                    "Хотел рассказать о праздниках дня, но свитки calend.ru не раскрылись.",
+                                    "Не удалось заказать о праздниках: увы, но ссылки calend.ru не обновились.",
                                 )
-                                bot.send_message(uid, "Сегодня подходящий день, чтобы просто радоваться жизни.")
+                                bot.send_message(uid, "Сегодня прошел праздничный день, чтобы просто радоваться жизни.")
+                        elif kind_name == _KIND_FILMS:
+                            if now_local.day != 1:
+                                continue
+                            try:
+                                messages = build_monthly_messages(now_local.date())
+                                if not messages:
+                                    bot.send_message(uid, "На этот месяц премьер не найдено.")
+                                else:
+                                    for payload in messages:
+                                        bot.send_message(
+                                            uid,
+                                            payload,
+                                            parse_mode="HTML",
+                                            disable_web_page_preview=True,
+                                        )
+                                sent = True
+                            except Exception as exc:
+                                logger.warning("Failed to fetch films for schedule (user=%s): %s", uid, exc)
+                                bot.send_message(uid, "Не получилось получить список премьер. Попробуйте позже.")
                         else:
                             quote = _random_quote(quotes_file)
                             caption = f"База дня: {quote}"
                             _send_random_media_with_caption(bot, uid, media_dir, caption)
                             sent = True
-
                         if sent:
                             logger.info("Sent %s update to user %s at %s", kind_name, uid, at_time)
                             kind_entry["last_sent"] = {at_time: today}

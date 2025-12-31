@@ -3,13 +3,17 @@ import os
 import random
 import re
 import sys
+import subprocess
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 import importlib.util
 import logging
+import time
 
 import requests
 import telebot
+import telebot.apihelper as apihelper
 from telebot.types import ReplyParameters
 from telebot.types import (
     InlineKeyboardMarkup,
@@ -21,6 +25,7 @@ from telebot.types import (
 )
 
 from holidays import HolidayService
+import films
 
 
 # --- гарантированно импортируем ЛОКАЛЬНЫЙ schedule.py рядом с bot.py ---
@@ -74,6 +79,8 @@ if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var with your bot token")
 
 bot = telebot.TeleBot(TOKEN)
+apihelper.CONNECT_TIMEOUT = 20
+apihelper.READ_TIMEOUT = 90
 holiday_service = HolidayService()
 
 DATA_FILE = Path("users.json")
@@ -572,6 +579,21 @@ def format_user_line(uid: str, meta: dict) -> str:
     return f"- {uid} | {uname} | {name} | {ts}"
 
 
+def _set_commands_with_retry(bot_instance, commands, scope, label: str, retries: int = 3, base_delay: float = 1.0) -> bool:
+    for attempt in range(1, retries + 1):
+        try:
+            bot_instance.set_my_commands(commands, scope=scope)
+            return True
+        except Exception as exc:
+            if attempt == retries:
+                logger.warning("Failed to update %s after %d attempt(s): %s", label, retries, exc)
+                return False
+            delay = base_delay * attempt
+            logger.warning("Retrying %s in %.1fs due to error: %s", label, delay, exc)
+            time.sleep(delay)
+    return False
+
+
 def setup_commands():
     # Команды, которые видят ВСЕ
     common_commands = [
@@ -579,6 +601,7 @@ def setup_commands():
         BotCommand("id", "Узнать свой знак (user_id)"),
         BotCommand("schedule", "График рассылки"),  # рекомендую показывать всем допущенным
         BotCommand("holydays", "Праздники сегодняшнего дня"),
+        BotCommand("films_month", "Премьеры месяца (Кинопоиск)"),
     ]
 
     # Команды, которые видит ТОЛЬКО админ
@@ -590,26 +613,23 @@ def setup_commands():
         BotCommand("restart", "Перезапустить"),
     ]
 
-    try:
-        bot.set_my_commands(common_commands, scope=BotCommandScopeDefault())
+    if _set_commands_with_retry(
+        bot,
+        common_commands,
+        BotCommandScopeDefault(),
+        "default commands",
+    ):
+        logger.info("Default commands updated (%d)", len(common_commands))
 
-        data = load_json()
-        for admin_id in data.get("admins", []):
-            try:
-                bot.set_my_commands(
-                    common_commands + admin_commands,
-                    scope=BotCommandScopeChatMember(chat_id=admin_id, user_id=admin_id),
-                )
-            except Exception:
-                try:
-                    bot.set_my_commands(
-                        common_commands + admin_commands,
-                        scope=BotCommandScopeChat(chat_id=admin_id),
-                    )
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    data = load_json()
+    for admin_id in data.get("admins", []):
+        if _set_commands_with_retry(
+            bot,
+            common_commands + admin_commands,
+            BotCommandScopeChat(chat_id=admin_id),
+            f"admin commands for {admin_id} (chat)",
+        ):
+            logger.info("Admin commands updated for %s (chat)", admin_id)
 
 
 def announce_startup():
@@ -622,6 +642,53 @@ def announce_startup():
             bot.send_message(admin_id, text)
         except Exception:
             pass
+
+
+def _start_journalctl_forwarder(unit_name: str, logger_name: str = "legendalf.journal") -> None:
+    if not unit_name or sys.platform.startswith("win"):
+        return
+
+    log = logging.getLogger(logger_name)
+    line_re = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \w+ \[legendalf\.")
+    systemd_re = re.compile(r"\b(systemd\[\d+\]|legendalf\.service:)\b", re.IGNORECASE)
+
+    def run():
+        cmd = ["journalctl", "-u", unit_name, "-f", "--no-pager", "-o", "cat"]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            log.warning("journalctl forwarder failed to start: %s", exc)
+            return
+
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # Skip lines that already look like our own structured logs to avoid duplication.
+                if line_re.match(line):
+                    continue
+                # Skip systemd service lifecycle noise.
+                if systemd_re.search(line):
+                    continue
+                log.info("%s", line)
+        except Exception as exc:
+            log.warning("journalctl forwarder stopped: %s", exc)
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=run, name="journalctl-forwarder", daemon=True)
+    t.start()
 
 
 def restart_self():
@@ -943,6 +1010,7 @@ if __name__ == "__main__":
     logger.info("Legendalf bot starting. Logs: %s", LOG_FILE)
     setup_commands()
     announce_startup()
+    _start_journalctl_forwarder("legendalf")
 
     # Регистрируем модуль расписаний «База дня»
     schedule.register(
@@ -955,5 +1023,6 @@ if __name__ == "__main__":
         poll_interval_sec=30,
         holiday_service=holiday_service,
     )
+    films.register(bot, is_allowed)
 
-    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+    bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
