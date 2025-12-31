@@ -642,23 +642,33 @@ def register(
         except HolidayFetchError:
             logger.warning("Failed to fetch holidays for /holydays (user %s)", message.from_user.id)
             reply(message, "Не удалось достать праздники. Похоже, свитки calend.ru не открылись.")
+            reply(message, "Сегодня подходящий день, чтобы просто радоваться жизни.")
             return
 
         caption = build_holiday_caption(daily)
-        photo = image_stream(daily)
+        photo = daily.image_url or image_stream(daily)
+        photo_sent = False
         if photo:
-            bot.send_photo(
-                message.chat.id,
-                photo,
-                reply_parameters=_build_reply_parameters(
-                    message.message_id, allow_without_reply=True
-                ),
-            )
-            logger.info(
-                "Sent holidays with image to user %s (names=%d)",
-                message.from_user.id,
-                len(daily.name_titles),
-            )
+            try:
+                bot.send_photo(
+                    message.chat.id,
+                    photo,
+                    reply_parameters=_build_reply_parameters(
+                        message.message_id, allow_without_reply=True
+                    ),
+                )
+                photo_sent = True
+                logger.info(
+                    "Sent holidays with image to user %s (names=%d)",
+                    message.from_user.id,
+                    len(daily.name_titles),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send holidays image for /holydays (user %s): %s",
+                    message.from_user.id,
+                    exc,
+                )
         bot.send_message(
             message.chat.id,
             caption,
@@ -667,7 +677,7 @@ def register(
                 message.message_id, allow_without_reply=True
             ),
         )
-        if not photo:
+        if not photo_sent:
             logger.info(
                 "Sent holidays text only to user %s (names=%d)",
                 message.from_user.id,
@@ -762,10 +772,13 @@ def register(
                             try:
                                 daily = holiday_service.get_daily(now_local.date())
                                 caption = build_holiday_caption(daily)
-                                photo = image_stream(daily)
+                                photo = daily.image_url or image_stream(daily)
                                 if photo:
-                                    bot.send_photo(uid, photo)
-                                    logger.info("Sent holiday image update to %s", uid)
+                                    try:
+                                        bot.send_photo(uid, photo)
+                                        logger.info("Sent holiday image update to %s", uid)
+                                    except Exception as exc:
+                                        logger.warning("Failed to send holiday image to %s: %s", uid, exc)
                                 else:
                                     logger.info("Sent holiday text-only update to %s", uid)
                                 bot.send_message(uid, caption, parse_mode="HTML")
@@ -776,6 +789,7 @@ def register(
                                     uid,
                                     "Хотел рассказать о праздниках дня, но свитки calend.ru не раскрылись.",
                                 )
+                                bot.send_message(uid, "Сегодня подходящий день, чтобы просто радоваться жизни.")
                         else:
                             quote = _random_quote(quotes_file)
                             caption = f"База дня: {quote}"

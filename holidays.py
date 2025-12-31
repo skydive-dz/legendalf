@@ -114,7 +114,7 @@ class HolidayService:
 
     def _fetch_url(self, url: str) -> str:
         try:
-            resp = self.session.get(url, timeout=30)
+            resp = self.session.get(url, timeout=60)
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as exc:

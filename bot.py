@@ -390,7 +390,7 @@ def _download_telegram_file_stream(file_path: str, out_path: Path) -> None:
     url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with requests.get(url, stream=True, timeout=(15, 600)) as r:
+    with requests.get(url, stream=True, timeout=(30, 600)) as r:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1 MB
