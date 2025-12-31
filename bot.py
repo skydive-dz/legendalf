@@ -11,6 +11,7 @@ import importlib.util
 import functools
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import shutil
 import time
 
 import requests
@@ -63,6 +64,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "legendalf.log"
+METRICS_LOG_FILE = LOG_DIR / "legendalf.metrics.log"
 
 log_format = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 file_handler = TimedRotatingFileHandler(
@@ -75,6 +77,16 @@ file_handler = TimedRotatingFileHandler(
 )
 file_handler.suffix = "%d-%m-%Y"
 
+metrics_handler = TimedRotatingFileHandler(
+    METRICS_LOG_FILE,
+    when="midnight",
+    interval=1,
+    backupCount=0,
+    encoding="utf-8",
+    delay=True,
+)
+metrics_handler.suffix = "%d-%m-%Y"
+
 logging.basicConfig(
     level=logging.INFO,
     format=log_format,
@@ -84,6 +96,11 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("legendalf.bot")
+
+metrics_logger = logging.getLogger("legendalf.metrics")
+metrics_logger.setLevel(logging.INFO)
+metrics_logger.addHandler(metrics_handler)
+metrics_logger.propagate = False
 
 telebot.logger = logging.getLogger("legendalf.telebot")
 telebot.logger.setLevel(logging.INFO)
@@ -125,6 +142,122 @@ def _wrap_bot_send(bot_instance, min_delay: float = 0.3, max_delay: float = 1.0)
 
 
 _wrap_bot_send(bot)
+
+
+def _read_proc_stat() -> tuple[int, int] | None:
+    try:
+        line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+    except Exception:
+        return None
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    values = [int(v) for v in parts[1:] if v.isdigit()]
+    if not values:
+        return None
+    total = sum(values)
+    idle = values[3] if len(values) > 3 else 0
+    return total, idle
+
+
+def _read_meminfo() -> tuple[int, int] | None:
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    total_kb = available_kb = None
+    for line in lines:
+        if line.startswith("MemTotal:"):
+            total_kb = int(line.split()[1])
+        elif line.startswith("MemAvailable:"):
+            available_kb = int(line.split()[1])
+    if total_kb is None or available_kb is None:
+        return None
+    return total_kb * 1024, available_kb * 1024
+
+
+def _read_net_dev() -> tuple[int, int] | None:
+    try:
+        lines = Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    rx_total = 0
+    tx_total = 0
+    for line in lines[2:]:
+        if ":" not in line:
+            continue
+        _, data = line.split(":", 1)
+        parts = data.split()
+        if len(parts) < 16:
+            continue
+        rx_total += int(parts[0])
+        tx_total += int(parts[8])
+    return rx_total, tx_total
+
+
+def _start_metrics_logger(interval_sec: int = 60) -> None:
+    prev_cpu = None
+    prev_net = None
+    prev_time = time.monotonic()
+
+    def run():
+        nonlocal prev_cpu, prev_net, prev_time
+        while True:
+            start = time.monotonic()
+            mem = _read_meminfo()
+            cpu = _read_proc_stat()
+            net = _read_net_dev()
+
+            cpu_pct = None
+            if cpu and prev_cpu:
+                total_delta = cpu[0] - prev_cpu[0]
+                idle_delta = cpu[1] - prev_cpu[1]
+                if total_delta > 0:
+                    cpu_pct = (1 - idle_delta / total_delta) * 100
+            prev_cpu = cpu
+
+            net_rx_bps = net_tx_bps = None
+            if net and prev_net:
+                dt = max(1e-6, start - prev_time)
+                net_rx_bps = (net[0] - prev_net[0]) / dt
+                net_tx_bps = (net[1] - prev_net[1]) / dt
+            prev_net = net
+            prev_time = start
+
+            load1 = load5 = load15 = None
+            try:
+                load1, load5, load15 = os.getloadavg()
+            except Exception:
+                pass
+
+            disk = shutil.disk_usage(BASE_DIR)
+            disk_used_pct = disk.used / disk.total * 100 if disk.total else 0
+
+            if mem:
+                mem_total, mem_available = mem
+                mem_used_pct = (mem_total - mem_available) / mem_total * 100 if mem_total else 0
+            else:
+                mem_used_pct = None
+
+            metrics_logger.info(
+                "cpu_pct=%.1f load1=%.2f load5=%.2f load15=%.2f "
+                "mem_used_pct=%.1f disk_used_pct=%.1f "
+                "net_rx_bps=%.0f net_tx_bps=%.0f",
+                cpu_pct if cpu_pct is not None else -1.0,
+                load1 if load1 is not None else -1.0,
+                load5 if load5 is not None else -1.0,
+                load15 if load15 is not None else -1.0,
+                mem_used_pct if mem_used_pct is not None else -1.0,
+                disk_used_pct,
+                net_rx_bps if net_rx_bps is not None else -1.0,
+                net_tx_bps if net_tx_bps is not None else -1.0,
+            )
+
+            elapsed = time.monotonic() - start
+            time.sleep(max(1, interval_sec - elapsed))
+
+    t = threading.Thread(target=run, name="metrics-logger", daemon=True)
+    t.start()
 
 DATA_FILE = Path("users.json")
 QUOTES_FILE = Path("/home/skydive-dz/legendalf/quotes.txt")
@@ -1098,6 +1231,7 @@ if __name__ == "__main__":
     setup_commands()
     announce_startup()
     _start_journalctl_forwarder("legendalf")
+    _start_metrics_logger()
 
     # Регистрируем модуль расписаний «База дня»
     schedule.register(
