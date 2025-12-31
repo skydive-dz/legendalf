@@ -8,6 +8,7 @@ import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 import importlib.util
+import functools
 import logging
 import time
 
@@ -80,9 +81,38 @@ if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var with your bot token")
 
 bot = telebot.TeleBot(TOKEN)
-apihelper.CONNECT_TIMEOUT = 20
-apihelper.READ_TIMEOUT = 90
+apihelper.CONNECT_TIMEOUT = 60
+apihelper.READ_TIMEOUT = 180
 holiday_service = HolidayService()
+
+
+def _wrap_bot_send(bot_instance, min_delay: float = 0.3, max_delay: float = 1.0) -> None:
+    def wrap(name: str) -> None:
+        original = getattr(bot_instance, name, None)
+        if not callable(original):
+            return
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            try:
+                return original(*args, **kwargs)
+            finally:
+                time.sleep(random.uniform(min_delay, max_delay))
+
+        setattr(bot_instance, name, wrapped)
+
+    for method_name in (
+        "send_message",
+        "send_photo",
+        "send_video",
+        "send_animation",
+        "send_document",
+        "send_media_group",
+    ):
+        wrap(method_name)
+
+
+_wrap_bot_send(bot)
 
 DATA_FILE = Path("users.json")
 QUOTES_FILE = Path("/home/skydive-dz/legendalf/quotes.txt")
@@ -580,6 +610,23 @@ def format_user_line(uid: str, meta: dict) -> str:
     return f"- {uid} | {uname} | {name} | {ts}"
 
 
+def _build_new_year_recipients(data: dict) -> list[int]:
+    recipients: set[int] = set()
+    for admin_id in data.get("admins", []):
+        try:
+            recipients.add(int(admin_id))
+        except Exception:
+            continue
+    allowed = data.get("allowed", {})
+    if isinstance(allowed, dict):
+        for suid in allowed.keys():
+            try:
+                recipients.add(int(suid))
+            except Exception:
+                continue
+    return sorted(recipients)
+
+
 def _set_commands_with_retry(bot_instance, commands, scope, label: str, retries: int = 3, base_delay: float = 1.0) -> bool:
     for attempt in range(1, retries + 1):
         try:
@@ -933,7 +980,32 @@ def admin_ingest(message):
         if text.startswith("/"):
             return
 
-        # секретные фразы должны работать и для админа
+        t_norm = re.sub(r"\s+", " ", text.casefold()).strip()
+        ny_triggers = {
+            "гендальф, с новым годом!",
+            "гендальф с новым годом!",
+            "гендальф, с новым годом",
+            "гендальф с новым годом",
+        }
+        if t_norm in ny_triggers:
+            data = load_json()
+            recipients = _build_new_year_recipients(data)
+            if not recipients:
+                bot.reply_to(message, "No recipients found.")
+                return
+
+            greeting = getattr(schedule, "_NEW_YEAR_GREETING", "Happy New Year!")
+            sent = 0
+            failed = 0
+            for uid in recipients:
+                try:
+                    bot.send_message(uid, greeting)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            bot.reply_to(message, f"Done: sent {sent}, failed {failed}.")
+            return
+
         if is_media_trigger(text):
             send_random_media(message.chat.id, reply_to_message_id=message.message_id)
             return

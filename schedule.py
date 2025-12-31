@@ -916,11 +916,10 @@ def register(
                             schedules[suid] = entry
                             dirty = True
 
-                    if holiday_enabled:
-                        allowed_meta = allowed_map.get(suid)
-                        if _maybe_send_special_messages(bot, uid, entry, now_local, allowed_meta):
-                            schedules[suid] = entry
-                            dirty = True
+                    allowed_meta = allowed_map.get(suid)
+                    if _maybe_send_special_messages(bot, uid, entry, now_local, allowed_meta):
+                        schedules[suid] = entry
+                        dirty = True
 
                 if dirty:
                     data["schedules"] = schedules
