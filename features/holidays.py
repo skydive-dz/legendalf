@@ -1,7 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import asyncio
 import html as html_lib
 import io
+import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -10,7 +12,17 @@ from typing import Iterable
 from urllib.parse import urljoin, urlparse
 
 import requests
+from aiogram import Router
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.exceptions import TelegramNetworkError
+
+from retry_utils import retry_async, RETRY_DELAYS_LONG, RETRY_DELAYS_SHORT
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger("legendalf.features.holidays")
+
+router = Router()
 
 
 class HolidayFetchError(Exception):
@@ -118,7 +130,7 @@ class HolidayService:
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as exc:
-            raise HolidayFetchError(f"Не удалось получить страницу {url} ({exc}).") from exc
+            raise HolidayFetchError(f"Не удалось достать страницу {url} ({exc}).") from exc
 
     def _fetch_day_page(self, date_key: str) -> str:
         return self._fetch_url(self.BASE_DAY_URL.format(date=date_key))
@@ -138,7 +150,7 @@ class HolidayService:
             items = self._parse_day_items(day_soup)
 
         if not items:
-            raise HolidayFetchError("Страница не вернула ни одного праздника.")
+            raise HolidayFetchError("Не нашёл ни одного праздника.")
 
         image_url = self._extract_feature_image(detail_soup)
         if not image_url:
@@ -187,7 +199,7 @@ class HolidayService:
         target_ul = None
         for h3 in soup.find_all("h3"):
             text = h3.get_text(" ", strip=True).lower()
-            if "что важного" in text:
+            if "праздники сегодня" in text:
                 candidate = h3.find_next("ul")
                 if candidate:
                     target_ul = candidate
@@ -327,9 +339,9 @@ def build_name_section(date_key: str, names: Iterable[str]) -> str:
 
     names_line = ", ".join(_escape(n) for n in names_clean)
     text = (
-        "<b>Кто сегодня именинник?</b>\n"
-        f"{_escape(date_str)} празднуют именины {names_line}.\n"
-        "Уважаемые именинники, примите поздравления от Гэндальфа!"
+        "<b>Именинники:</b>\n"
+        f"{names_line}.\n"
+        "Примите поздравления от Гэндальфа!"
     )
     return text
 
@@ -340,3 +352,86 @@ def image_stream(daily: HolidayDaily):
     bio = io.BytesIO(daily.image_bytes)
     bio.name = daily.image_name or "holidays.jpg"
     return bio
+
+
+async def _safe_answer(message: Message, text: str, **kwargs) -> bool:
+    return await retry_async(
+        lambda: message.answer(text, **kwargs),
+        logger=logger,
+        delays=RETRY_DELAYS_SHORT,
+        retry_exceptions=(TelegramNetworkError, asyncio.TimeoutError),
+    )
+
+
+async def send_holiday_payload(bot, chat_id: int, photo, caption: str) -> None:
+    if photo:
+        if len(caption) <= 1024:
+            sent = await retry_async(
+                lambda: bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML"),
+                logger=logger,
+                label="send holidays photo",
+                delays=RETRY_DELAYS_LONG,
+                retry_exceptions=(TelegramNetworkError, asyncio.TimeoutError),
+            )
+            if sent:
+                return
+        await retry_async(
+            lambda: bot.send_photo(chat_id, photo),
+            logger=logger,
+            label="send holidays photo (no caption)",
+            delays=RETRY_DELAYS_LONG,
+            retry_exceptions=(TelegramNetworkError, asyncio.TimeoutError),
+        )
+
+    await retry_async(
+        lambda: bot.send_message(chat_id, caption, parse_mode="HTML"),
+        logger=logger,
+        label="send holidays text",
+        delays=RETRY_DELAYS_LONG,
+        retry_exceptions=(TelegramNetworkError, asyncio.TimeoutError),
+    )
+
+
+_config = {
+    "default_tz": "Europe/Moscow",
+    "holiday_service": None,
+    "is_allowed_fn": None,
+}
+
+
+def configure(*, default_tz: str, holiday_service: HolidayService | None, is_allowed_fn) -> None:
+    _config.update(
+        {
+            "default_tz": default_tz,
+            "holiday_service": holiday_service or HolidayService(),
+            "is_allowed_fn": is_allowed_fn,
+        }
+    )
+
+
+@router.message(Command("holydays"))
+async def cmd_holydays(message: Message) -> None:
+    logger.info("Command /holydays from %s", message.from_user.id)
+    if not _config["is_allowed_fn"](message.from_user.id):
+        await message.answer(
+            "Прежде чем приказывать времени, нужно получить допуск."
+        )
+        return
+
+    import schedule_aiogram
+
+    data = await schedule_aiogram.load_data()
+    entry = schedule_aiogram._ensure_user_schedule(data, message.from_user.id, _config["default_tz"])
+    tz_name = entry.get("tz", _config["default_tz"])
+    now_local = schedule_aiogram._local_now(tz_name)
+
+    try:
+        daily = await asyncio.to_thread(_config["holiday_service"].get_daily, now_local.date())
+    except HolidayFetchError:
+        await _safe_answer(message, "Не удалось достать праздники.")
+        await _safe_answer(message, "Сегодня подходящий день, чтобы просто радоваться жизни.")
+        return
+
+    caption = build_holiday_caption(daily)
+    photo = daily.image_url or image_stream(daily)
+    await send_holiday_payload(message.bot, message.chat.id, photo, caption)

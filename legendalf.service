@@ -1,0 +1,19 @@
+[Unit]
+Description=Legendalf Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skydive-dz
+Group=skydive-dz
+WorkingDirectory=/home/skydive-dz/legendalf
+EnvironmentFile=/etc/legendalf.env
+ExecStart=/home/skydive-dz/legendalf/.venv/bin/python /home/skydive-dz/legendalf/bot_aiogram.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
