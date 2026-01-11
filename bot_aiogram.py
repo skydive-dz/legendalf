@@ -531,23 +531,42 @@ async def notify_admins_new_request(bot: Bot, user) -> None:
 
 
 async def setup_commands(bot: Bot) -> None:
+    async def _set_commands(commands, scope=None, label: str = "set commands") -> bool:
+        return await retry_async(
+            lambda: bot.set_my_commands(commands, scope=scope) if scope else bot.set_my_commands(commands),
+            logger=logger,
+            label=label,
+            delays=RETRY_DELAYS_SHORT,
+            retry_exceptions=(TelegramNetworkError, asyncio.TimeoutError, aiohttp.ClientError),
+        )
+
     common_commands = [BotCommand(command=cmd, description=desc) for cmd, desc in COMMON_COMMANDS]
     admin_only_commands = [BotCommand(command=cmd, description=desc) for cmd, desc in ADMIN_ONLY_COMMANDS]
 
-    try:
-        await bot.set_my_commands(common_commands)
-    except Exception as exc:
-        logger.warning("Failed to set common commands: %s", exc)
+    if not await _set_commands(common_commands, label="set common commands"):
+        logger.warning("Failed to set common commands")
 
     admins = load_json().get("admins", [])
     for admin_id in admins:
-        try:
-            await bot.set_my_commands(
-                common_commands + admin_only_commands,
-                scope=BotCommandScopeChat(chat_id=int(admin_id)),
-            )
-        except Exception as exc:
-            logger.warning("Failed to set commands for admin %s: %s", admin_id, exc)
+        scope = BotCommandScopeChat(chat_id=int(admin_id))
+        if not await _set_commands(
+            common_commands + admin_only_commands,
+            scope=scope,
+            label=f"set admin commands {admin_id}",
+        ):
+            logger.warning("Failed to set commands for admin %s", admin_id)
+
+
+async def init_bot_username(bot: Bot) -> None:
+    try:
+        me = await bot.get_me()
+    except Exception as exc:
+        logger.warning("Failed to detect bot username: %s", exc)
+        return
+    if not getattr(me, "username", None):
+        return
+    features_films.set_bot_username(me.username)
+    logger.info("Film details links use @%s", me.username)
 
 
 async def notify_admins_start(bot: Bot) -> None:
@@ -946,6 +965,7 @@ async def run_polling() -> None:
             )
             logger.info("Setting bot commands in background")
             asyncio.create_task(setup_commands(bot))
+            asyncio.create_task(init_bot_username(bot))
             polling_active["value"] = True
             ready_task = asyncio.create_task(
                 notify_admins_ready(
